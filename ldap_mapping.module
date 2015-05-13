@@ -1,0 +1,271 @@
+<?php
+
+function ldap_mapping_block_info() {
+
+  $blocks['ldap_mapping'] = array(
+        'info' => t('LDAP Mapping'),
+        'cache' => DRUPAL_CACHE_GLOBAL,
+  );
+  return $blocks;
+
+}
+
+/**
+ * Valid permissions for this module
+ * @return array An array of valid permissions for the module
+ */
+function ldap_mapping_permission() {
+  return array(
+    'administer ldap mapping' => array(
+      'title' => t('Administer LDAP Mappings'),
+    ),
+  );
+}
+
+function ldap_mapping_menu() {
+  $items = array();
+
+  $items['admin/config/people/ldapmapping'] = array(
+    'title' => 'Ldap mapping module settings',
+    'description' => 'Configuration for mappings from LDAP',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ldap_mapping_form'),
+    'access arguments' => array('administer ldap mapping'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+function ldap_mapping_form($form, &$form_state) {
+
+  $form['ldap_mapping_reevaluate_ldap'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Keep updated with LDAP.'),
+      '#default_value' => variable_get('ldap_mapping_reevaluate_ldap', 0),
+      '#description' => t('NOTE: This means users could lose manual updates to LDAP controlled fields (eg Name, Phone Number) defined below'),
+  );
+    
+  $form['ldap_mapping_ldap_server'] = array(
+      '#type' => 'textfield',
+      '#title' => t('LDAP server address'),
+      '#default_value' => variable_get('ldap_mapping_ldap_server', 'ldap.example.com')
+  );
+
+  $form['ldap_mapping_ldap_port'] = array(
+      '#type' => 'textfield',
+      '#title' => t('LDAP server port'),
+      '#default_value' => variable_get('ldap_mapping_ldap_port', '389')
+  );
+
+  $form['ldap_mapping_ldap_bind_user'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Bind user for authentication to the LDAP server'),
+      '#default_value' => variable_get('ldap_mapping_ldap_bind_user', ''),
+      '#description' => t('eg: <em>uid=drupal,ou=special,o=the university of queensland,c=au</em>'),
+  );
+
+  $form['ldap_mapping_ldap_bind_pass'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Bind password for authentication to the LDAP server'),
+      '#default_value' => variable_get('ldap_mapping_ldap_bind_pass', ''),
+      '#description' => t('eg: <em>securepassword</em>'),
+  );
+
+  $form['ldap_mapping_ldap_mappings'] = array(
+      '#type' => 'textarea',
+      '#title' => t('LDAP to Field Mappings'),
+      '#default_value' => variable_get('ldap_mapping_ldap_mappings', ''),
+      '#description' => t('A separated list of mappings between LDAP attributes and user values, put each mapping on a new line.<br />Example: <em>ldapattribute:drupal_user_field</em> <br />For example: <em>cn:field_fullname</em>'),
+   );
+
+  $form['ldap_mapping_role_mappings'] = array(
+      '#type' => 'textarea',
+      '#title' => t('LDAP to Role mappings'),
+      '#default_value' => variable_get('ldap_mapping_role_mappings', ''),
+      '#description' => t('A pipe separated list of rules.<br />Example: roleid1:condition1|roleid2:contition2...<br />For example: 1:eduPersonPrincipalName,@=,uninett.no;affiliation,=,employee|2:mail,=,andreas@uninett.no'),
+  );
+
+  return system_settings_form($form);
+
+}
+
+//This just does some magic to sanitize the user input (trys to prevent LDAP injection)
+function ldap_escape($str, $for_dn = false) {
+        // see:
+        // RFC2254
+        // http://msdn.microsoft.com/en-us/library/ms675768(VS.85).aspx
+        // http://www-03.ibm.com/systems/i/software/ldap/underdn.html
+
+        if ($for_dn)
+                $metaChars = array(',', '=', '+', '<', '>',';', '\\', '"', '#');
+        else
+                $metaChars = array('*', '(', ')', '\\', chr(0));
+
+        $quotedMetaChars = array();
+
+        foreach ($metaChars as $key => $value) $quotedMetaChars[$key] = '\\'.str_pad(dechex(ord($value)), 2, '0');
+        return (str_replace($metaChars, $quotedMetaChars, $str)); //replace them
+}
+
+function ds_connect($url, $user, $pass) {
+	$c = ldap_connect($url);
+	ldap_set_option($c, LDAP_OPT_PROTOCOL_VERSION, 3);
+	if (!ldap_bind($c, $user, $pass))
+		return NULL;
+
+	return $c;
+}
+
+function ds_getuser($ds, $uid) {
+	$base = "DC=int,DC=tri,DC=edu,DC=au";
+	$filter = "(samaccountname=" . ldap_escape($uid) . ")";
+
+	$sr = ldap_search($ds, $base, $filter);
+	$entry = ldap_get_entries($ds, $sr);
+
+	if ($entry['count'] > 1)
+		error_log("ds_getuser: returned more than one result.");
+	else if ($entry['count'] == 0) {
+		error_log("ds_getuser: could not find $uid in directory");
+		return NULL;
+	}
+
+	return $entry[0];
+}
+
+function ds_map($account, $entry, $mapping) {
+	$map = explode(':', $mapping);
+	$val = NULL;
+
+	if (isset($entry[$map[0]])) {
+		if ($entry[$map[0]]['count'] > 1) {
+			for ($i = 0; $i < $entry[$map[0]]['count']; $i++)
+				$val .= $entry[$map[0]][$i] . "\n";
+		} else {
+			$val = $entry[$map[0]][0];
+		}
+	}
+
+	if ($val == NULL)
+		return NULL; 
+
+	return array(
+		trim($map[1]) => array(
+			'und' => array(
+				0 => array(
+					'value' => trim($val)
+				),
+			),
+		),
+	);
+}
+
+function do_mapping($uid, $name) {
+	$ds = ds_connect(
+		variable_get('ldap_mapping_ldap_server', 'ldap.example.com'),
+		variable_get('ldap_mapping_ldap_bind_user', ''),
+		variable_get('ldap_mapping_ldap_bind_pass', '')
+	);
+
+	if (!$ds) {
+		error_log("problem with directory server connection");
+		return;
+	}
+
+	$e = ds_getuser($ds, $uid);
+	if (!$e) {
+		error_log('Couldn\'t find user details for ' . $uid); 
+		ldap_close($ds);
+		return;
+	}
+
+	$mappings = explode("\n", variable_get('ldap_mapping_ldap_mappings', ''));
+	foreach ($mappings as $map) {
+		$account = user_load_by_name($name);
+		$s = ds_map($account, $e, $map);
+		if ($s)
+			user_save($account, $s);
+	}
+
+	if (($roles = do_roles($e, $uid, $name))) {
+		$account->roles = $roles;
+		$edit = array();
+		user_save($account, $edit);
+	} 
+
+	ldap_close($ds);
+}
+
+/* using the same method as simplesamlphp_auth */
+function do_roles($entry, $uid, $name) {
+	$rolemap = variable_get('ldap_mapping_role_mappings', '');
+	$roles = array();
+
+	$rolerules = explode('|', $rolemap);
+	foreach ($rolerules as $rolerule) {
+		$roleruledecompose = explode(':', $rolerule, 2);
+		$roleid = $roleruledecompose[0];
+		$roleruleevaluations = explode(';', $roleruledecompose[1]);
+		$addnew = TRUE;
+
+		foreach ($roleruleevaluations as $roleruleevaluation) {
+			$roleruleevaluationdc = explode(',', $roleruleevaluation);
+
+			if (!evalulate_role_rule($roleruleevaluationdc, $entry))
+				$addnew = FALSE;
+		}
+		
+		if ($addnew)
+			$roles[$roleid] = $roleid;
+	}
+
+	return $roles;
+}
+
+function evalulate_role_rule($evaluation, $attributes) {
+	if (!array_key_exists($evaluation[0], $attributes))
+		return FALSE;
+
+	$attribute = &$attributes[$evaluation[0]];
+
+	switch ($evaluation[1]) {
+	case '=':
+		return in_array($evaluation[2], $attribute);
+
+	case '$=':
+		$len = strlen($evaluation[2]);
+
+		reset($attribute);
+		foreach ($attribute as $a) {
+			if (strlen($a) >= $len &&
+			    strcasecmp(substr($a, 0 - $le), $evaluation[2]))
+				return TRUE;
+		}
+
+		return FALSE;
+
+	case '@=':
+		$dc = explode('@', $attribute[0]);
+		if (count($dc) != 2)
+			return FALSE;
+
+		return ($dc[1] == $evaluation[2]);
+	}
+
+	return FALSE;
+}
+
+function ldap_mapping_user_login() {
+        global $user;
+
+	if (!$user->uid)
+		return;
+
+	$account = user_load($user->uid);
+	if (variable_get('ldap_mapping_reevaluate_ldap', 0) != 1 && 
+	    isset($account->field_profile_firstname['und']['0']['value']))
+		return;
+
+	do_mapping($user->name, $user->name);
+}

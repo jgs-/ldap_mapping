@@ -1,0 +1,6 @@
+name = LDAP attribute mapping 
+description = Map central LDAP attributes to Drupal roles
+package = Firecannon 
+core = 7.x
+
+configure = admin/config/people/ldapmapping
